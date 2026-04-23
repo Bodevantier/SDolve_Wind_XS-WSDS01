@@ -23,7 +23,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Set the project name
-set(CMAKE_PROJECT_NAME Sensor_to_N2K_PCB_V1.0_Test_7_XS-WSDS01_to_N2K)
+set(CMAKE_PROJECT_NAME SDolve_Wind_XS-WSDS01)
 
 # Enable compile command to ease indexing with e.g. clangd
 set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)

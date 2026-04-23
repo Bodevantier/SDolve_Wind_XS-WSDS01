@@ -79,19 +79,54 @@ void GetWindData(float *speed_ms, float *dir_deg, bool *valid);
 void NMEA2000_SendWindData(tNMEA2000_STM32 *N2k);
 float filter_wind_direction(float new_dir);
 void PollWindSensor();
+void LED_Update(void);
+void LED2_Flash(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 extern "C" CAN_HandleTypeDef hcan;
 
+// ====== LED status ======
+// LED1: N2K bus – slow blink while claiming address, solid ON when open
+// LED2: Data TX  – brief 50 ms flash on each successful wind PGN send
+#define LED2_FLASH_MS      50
+static bool     n2k_is_open    = false;
+static uint32_t led2_off_tick  = 0;
+
+void LED_Update(void)
+{
+  // LED1: blink at 1 Hz until N2K is open, then solid ON
+  if (n2k_is_open) {
+    HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+  } else {
+    GPIO_PinState state = (HAL_GetTick() % 1000u < 500u) ? GPIO_PIN_SET : GPIO_PIN_RESET;
+    HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, state);
+  }
+
+  // LED2: switch off after flash duration expires
+  if (led2_off_tick != 0u && HAL_GetTick() >= led2_off_tick) {
+    HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
+    led2_off_tick = 0u;
+  }
+}
+
+void LED2_Flash(void)
+{
+  HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET);
+  led2_off_tick = HAL_GetTick() + LED2_FLASH_MS;
+}
+
 // ====== Timing configuration ======
-#define WIND_UPDATE_PERIOD  200  // ms (5 Hz) - optimal for wind data, matches sensor poll rate
-#define WIND_OFFSET         0    // ms (offset from other messages)
+#define WIND_UPDATE_PERIOD  100  // ms – PGN 130306 default period per NMEA2000 spec
+#define WIND_OFFSET         300  // ms – offset ≥250 ms avoids send failures during address claim window
 
 // ====== Message Scheduler ======
-// Define scheduler for wind messages. Disabled at start, will be enabled in OnN2kOpen
+// Disabled at start; OnN2kOpen synchronises it to the library open time.
 tN2kSyncScheduler WindScheduler(false, WIND_UPDATE_PERIOD, WIND_OFFSET);
+
+// Rolling SID – ties PGN samples from the same cycle together (0-252, then wraps)
+static unsigned char windSID = 0;
 
 /* Simple moving average filter for wind direction */
 float filter_wind_direction(float new_dir)
@@ -162,7 +197,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-i flk  HAL_Init();
+   HAL_Init();
 
   /* USER CODE BEGIN Init */
 
@@ -207,16 +242,21 @@ i flk  HAL_Init();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    // Update LED status indicators
+    LED_Update();
+
+    // Poll wind sensor (RS485 – non-blocking, governed by WIND_POLL_PERIOD)
+    PollWindSensor();
+
+    // Send wind data to N2K network when scheduler fires
+    NMEA2000_SendWindData(&N2k);
+
     // Process serial debug commands
     SerialDebug_Poll();
 
-    // Poll wind sensor
-    PollWindSensor();
-
-    // Send wind data to N2K network
-    NMEA2000_SendWindData(&N2k);
-    
-    // Process NMEA2000 messages
+    // Service N2K stack: flushes TX buffer, handles ISO requests, heartbeat, etc.
+    // Called once per loop iteration at the end – the library docs say
+    // "ParseMessages() should be called as often as possible without delays".
     N2k.ParseMessages();
   }
   /* USER CODE END 3 */
@@ -268,28 +308,40 @@ void SystemClock_Config(void)
 // =====================
 void NMEA2000_Init(tNMEA2000_STM32 *N2k)
 {
+  // Use STM32 96-bit UID so each physical unit has a unique N2K identity.
+  const uint32_t uid0 = *(const volatile uint32_t *)0x1FFFF7E8UL;
+  const uint32_t uid1 = *(const volatile uint32_t *)0x1FFFF7ECUL;
+  const uint32_t uid2 = *(const volatile uint32_t *)0x1FFFF7F0UL;
+  static char serial_code[33];
+  snprintf(serial_code, sizeof(serial_code), "%08lX%08lX%08lX",
+           (unsigned long)uid0, (unsigned long)uid1, (unsigned long)uid2);
+  const uint32_t unique_number = (uid0 ^ uid1 ^ uid2) & 0x1FFFFFUL;
+
   // Set Product information - Wind sensor gateway
-  N2k->SetProductInformation("00000007",                       // Manufacturer's Model serial code
+  N2k->SetProductInformation(serial_code,                       // Manufacturer's Model serial code
                              100,                              // Manufacturer's product code
-                             "XS-WSDS01 Wind",         // Manufacturer's Model ID
+                             "SDolve Wind",                    // Manufacturer's Model ID
                              "1.0.0.1 (2026-01-15)",          // Manufacturer's Software version code
-                             "1.0.0.0 (2026-01-15)"           // Manufacturer's Model version
+                             "1.0.0.0 (2026-01-15)",          // Manufacturer's Model version
+                             1                                 // Load equivalency: 1 × 50 mA = 50 mA
                              );
   
   // Set device information - Atmospheric sensor
-  N2k->SetDeviceInformation(1,    // Unique number. Use e.g. Serial number.
+  N2k->SetDeviceInformation(unique_number,    // Unique number. Use e.g. Serial number.
                             130,  // Device function=Atmospheric. See codes on NMEA.org
                             85,   // Device class=External Environment
                             2046  // Manufacturer code - free from NMEA.org list
                             );
 
-  // Keep identity fields available for request/reply PGN 126998.
-  N2k->SetConfigurationInformation("XSense Marine",
-                                   "XS-WSDS01 masthead wind",
-                                   "Wind to N2K bridge");
+  // PGN 126998 Configuration Information – responds automatically to ISO requests.
+  // Param order: ManufacturerInformation, InstallationDescription1, InstallationDescription2.
+  // InstallationDescription fields can be changed at runtime by NMEA 2000 group function.
+  N2k->SetConfigurationInformation("SDolve Marine",
+                                   "SDolve Wind – masthead anemometer",
+                                   "RS-485 to NMEA 2000 bridge");
   
   // Node mode - listen to requests and respond appropriately
-  N2k->SetMode(tNMEA2000::N2km_ListenAndNode, 23);
+  N2k->SetMode(tNMEA2000::N2km_NodeOnly, 23);
   N2k->EnableForward(false);
   
   // Declare which PGNs we transmit
@@ -308,6 +360,8 @@ void OnN2kOpen()
 {
   // Start scheduler when N2K bus communication begins
   WindScheduler.UpdateNextTime();
+  // LED1 stops blinking and goes solid
+  n2k_is_open = true;
 }
 
 // =====================
@@ -339,9 +393,15 @@ void NMEA2000_SendWindData(tNMEA2000_STM32 *N2k)
     if (valid) {
       // PGN 130306: Wind Data
       // Parameters: SID, WindSpeed (m/s), WindAngle (radians), WindReference
-      // N2kWind_Magnetic = True wind referenced to Magnetic North
-      SetN2kWindSpeed(N2kMsg, 1, WindSpeed, DegToRad(WindAngle), N2kWind_Magnetic);
-      N2k->SendMsg(N2kMsg);
+      // Apparent wind: angle 0° = bow, increases clockwise (0–360°).
+      SetN2kWindSpeed(N2kMsg, windSID, WindSpeed, DegToRad(WindAngle), N2kWind_Apprent);
+      if (N2k->SendMsg(N2kMsg)) {
+        LED2_Flash();  // Brief flash on each successful TX
+      }
+
+      // Advance SID (0-252 per NMEA 2000 spec; 253-255 are reserved)
+      windSID++;
+      if (windSID > 252) windSID = 0;
     }
   }
 }
