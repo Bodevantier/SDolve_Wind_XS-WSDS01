@@ -28,6 +28,7 @@
 extern "C" {
   #include "rs485_wind.h"
   #include "serial_debug.h"
+  #include "n2k_storage.h"
 }
 
 // C++ NMEA2000 libraries
@@ -35,6 +36,7 @@ extern "C" {
 #include "NMEA2000_STM32.hpp"
 #include "N2kMessages.h"
 #include "N2kTimer.h"
+#include <cmath>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -61,13 +63,20 @@ extern "C" {
 static float wind_speed_ms = 0.0f;
 static float wind_dir_deg = 0.0f;
 static uint32_t last_wind_poll = 0;
+static uint32_t last_wind_valid_tick = 0;   // tick of last successful sample
 static uint32_t wind_error_count = 0;
 static bool wind_data_valid = false;
 
-// Wind direction filtering (simple moving average)
-static float dir_filter[WIND_FILTER_SIZE] = {0};
+#define WIND_STALE_MS  1500u   // sample considered stale after this many ms
+
+// Wind direction filtering (vector moving average – handles 0/360 wrap)
+static float dir_sin_filter[WIND_FILTER_SIZE] = {0};
+static float dir_cos_filter[WIND_FILTER_SIZE] = {0};
 static uint8_t dir_filter_idx = 0;
 static uint8_t dir_filter_valid = 0;
+
+// Independent watchdog – ~2 s timeout (LSI 40 kHz / 64 / 1250 ≈ 2.0 s)
+static IWDG_HandleTypeDef hiwdg;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -128,18 +137,28 @@ tN2kSyncScheduler WindScheduler(false, WIND_UPDATE_PERIOD, WIND_OFFSET);
 // Rolling SID – ties PGN samples from the same cycle together (0-252, then wraps)
 static unsigned char windSID = 0;
 
-/* Simple moving average filter for wind direction */
-float filter_wind_direction(float new_dir)
+// Pointer captured for use inside OnN2kOpen (library callback takes no args)
+static tNMEA2000 *s_N2k = nullptr;
+
+/* Vector moving average filter for wind direction.
+ * Averages sin/cos components so the 0°/360° wrap is handled correctly
+ * (e.g. mean of 359° and 1° = 0°, not 180°). */
+float filter_wind_direction(float new_dir_deg)
 {
-  dir_filter[dir_filter_idx] = new_dir;
+  const float rad = new_dir_deg * (float)M_PI / 180.0f;
+  dir_sin_filter[dir_filter_idx] = sinf(rad);
+  dir_cos_filter[dir_filter_idx] = cosf(rad);
   dir_filter_idx = (dir_filter_idx + 1) % WIND_FILTER_SIZE;
   if (dir_filter_valid < WIND_FILTER_SIZE) dir_filter_valid++;
 
-  float sum = 0;
+  float s = 0.0f, c = 0.0f;
   for (uint8_t i = 0; i < dir_filter_valid; i++) {
-    sum += dir_filter[i];
+    s += dir_sin_filter[i];
+    c += dir_cos_filter[i];
   }
-  return sum / dir_filter_valid;
+  float deg = atan2f(s, c) * 180.0f / (float)M_PI;
+  if (deg < 0.0f) deg += 360.0f;
+  return deg;
 }
 
 /* Poll RS485 wind sensor */
@@ -157,8 +176,16 @@ void PollWindSensor()
 
       // Apply filtering
       wind_speed_ms = raw_speed;  // Speed doesn't need much filtering
-      wind_dir_deg = filter_wind_direction(raw_dir);
+
+      // Sensor reports angle counter-clockwise; convert to clockwise
+      // (compass / NMEA 2000) convention: 0°=N, 90°=E, 180°=S, 270°=W.
+      float dir_cw = 360.0f - raw_dir;
+      if (dir_cw >= 360.0f) dir_cw -= 360.0f;   // handles raw_dir == 0
+      if (dir_cw < 0.0f)    dir_cw += 360.0f;
+
+      wind_dir_deg = filter_wind_direction(dir_cw);
       wind_data_valid = true;
+      last_wind_valid_tick = now;
 
       // Debug output - convert floats to integers for display
       int speed_int = (int)(wind_speed_ms * 10);  // 2.2 -> 22
@@ -174,11 +201,16 @@ void PollWindSensor()
       wind_error_count++;
       if (wind_error_count >= 5)  // Report after 5 consecutive failures (1 second)
       {
-        static char err_msg[] = "Wind: SENSOR ERROR\r\n";
+        const char err_msg[] = "Wind: SENSOR ERROR\r\n";
         HAL_UART_Transmit(&huart1, (uint8_t*)err_msg, sizeof(err_msg)-1, 100);
         wind_data_valid = false;
         wind_error_count = 0;  // Reset to avoid spam
       }
+    }
+
+    // Stale-data guard: invalidate if no fresh sample for WIND_STALE_MS
+    if (wind_data_valid && (now - last_wind_valid_tick) > WIND_STALE_MS) {
+      wind_data_valid = false;
     }
   }
 }
@@ -219,29 +251,54 @@ int main(void)
   
   // Initialize debug serial (USART1)
   SerialDebug_Init(&huart1);
-  HAL_UART_Transmit(&huart1, (uint8_t*)"=== Wind Sensor to N2K Gateway ===\r\n", 37, 100);
-  HAL_UART_Transmit(&huart1, (uint8_t*)"Initializing...\r\n", 17, 100);
+  {
+    const char banner[] = "=== Wind Sensor to N2K Gateway ===\r\n";
+    HAL_UART_Transmit(&huart1, (uint8_t*)banner, sizeof(banner)-1, 100);
+    const char init_msg[] = "Initializing...\r\n";
+    HAL_UART_Transmit(&huart1, (uint8_t*)init_msg, sizeof(init_msg)-1, 100);
+  }
 
   // Initialize RS485 wind sensor on USART3 with DE/RE on PB2
   WindRS485_Init(&huart3, USART3_DE_RE_GPIO_Port, USART3_DE_RE_Pin);
   WindRS485_SetTimeouts(RS485_TOTAL_TO_MS, RS485_PERBYTE_MS);
-  HAL_UART_Transmit(&huart1, (uint8_t*)"Wind sensor initialized\r\n", 25, 100);
+  {
+    const char m[] = "Wind sensor initialized\r\n";
+    HAL_UART_Transmit(&huart1, (uint8_t*)m, sizeof(m)-1, 100);
+  }
 
   // Initialize NMEA2000
   tNMEA2000_STM32 N2k(&hcan);
   NMEA2000_Init(&N2k);
-  HAL_UART_Transmit(&huart1, (uint8_t*)"N2K network initialized\r\n", 25, 100);
-  HAL_UART_Transmit(&huart1, (uint8_t*)"System ready!\r\n\r\n", 17, 100);
+  {
+    const char m1[] = "N2K network initialized\r\n";
+    HAL_UART_Transmit(&huart1, (uint8_t*)m1, sizeof(m1)-1, 100);
+    const char m2[] = "System ready!\r\n\r\n";
+    HAL_UART_Transmit(&huart1, (uint8_t*)m2, sizeof(m2)-1, 100);
+  }
+
+  // Independent watchdog: prescaler /64 with 1250 reload @ 40 kHz LSI ≈ 2.0 s.
+  // Started AFTER all init so first-time flash erase (address persistence)
+  // cannot trip a reset.
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_64;
+  hiwdg.Init.Reload    = 1250;
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK) { Error_Handler(); }
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  uint32_t last_addr_check = 0;
+  uint32_t last_can_check  = 0;
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    // Service N2K stack first: dispatch RX (ISO requests, group functions,
+    // address claim) before any scheduled TX runs.
+    N2k.ParseMessages();
+
     // Update LED status indicators
     LED_Update();
 
@@ -254,10 +311,39 @@ int main(void)
     // Process serial debug commands
     SerialDebug_Poll();
 
-    // Service N2K stack: flushes TX buffer, handles ISO requests, heartbeat, etc.
-    // Called once per loop iteration at the end – the library docs say
-    // "ParseMessages() should be called as often as possible without delays".
-    N2k.ParseMessages();
+    // Persist negotiated source address if it changed (every 1 s).
+    uint32_t now_tick = HAL_GetTick();
+    if ((now_tick - last_addr_check) >= 1000u) {
+      last_addr_check = now_tick;
+      if (N2k.ReadResetAddressChanged()) {
+        uint8_t new_src = N2k.GetN2kSource(0);
+        if (N2kStorage_SaveSource(new_src)) {
+          char m[48];
+          int n = snprintf(m, sizeof(m),
+                           "N2K: source addr changed -> %u (saved)\r\n", new_src);
+          if (n > 0) HAL_UART_Transmit(&huart1, (uint8_t*)m, (uint16_t)n, 100);
+        }
+      }
+    }
+
+    // CAN bus-off recovery watchdog. With AutoBusOff enabled bxCAN recovers
+    // automatically after 128*11 recessive bits, but if for any reason the
+    // peripheral remains in bus-off > 5 s we force a re-init.
+    if ((now_tick - last_can_check) >= 5000u) {
+      last_can_check = now_tick;
+      if (HAL_CAN_GetError(&hcan) & HAL_CAN_ERROR_BOF) {
+        const char m[] = "CAN: bus-off persistent, re-init\r\n";
+        HAL_UART_Transmit(&huart1, (uint8_t*)m, sizeof(m)-1, 100);
+        HAL_CAN_Stop(&hcan);
+        HAL_CAN_DeInit(&hcan);
+        MX_CAN_Init();
+        // Re-open the N2K stack so filters/TX state are reconfigured.
+        N2k.Open();
+      }
+    }
+
+    // Kick the independent watchdog.
+    HAL_IWDG_Refresh(&hiwdg);
   }
   /* USER CODE END 3 */
 }
@@ -340,14 +426,29 @@ void NMEA2000_Init(tNMEA2000_STM32 *N2k)
                                    "SDolve Wind – masthead anemometer",
                                    "RS-485 to NMEA 2000 bridge");
   
-  // Node mode - listen to requests and respond appropriately
-  N2k->SetMode(tNMEA2000::N2km_NodeOnly, 23);
+  // Node mode – the library performs full ISO 11783-5 / J1939 address claim
+  // automatically. The argument below is the *preferred* source address;
+  // if it conflicts with a higher-priority device the library negotiates
+  // a free address and sets AddressChanged (we persist it in the main loop).
+  //
+  // Restore previously negotiated address if one is stored in flash;
+  // otherwise derive a stable preferred address from the MCU UID so two
+  // SDolve units on the same bus don't pick the same one on first boot.
+  uint8_t preferred_src;
+  if (!N2kStorage_LoadSource(&preferred_src) ||
+      preferred_src < 128 || preferred_src > 251) {
+    preferred_src = (uint8_t)(128u + (unique_number % 124u));  // dynamic range 128-251
+  }
+  N2k->SetMode(tNMEA2000::N2km_NodeOnly, preferred_src);
   N2k->EnableForward(false);
-  
+
   // Declare which PGNs we transmit
   static const unsigned long TransmitMessages[] PROGMEM = {130306L, 0};  // PGN 130306 = Wind Data
   N2k->ExtendTransmitMessages(TransmitMessages);
-  
+
+  // Capture pointer for OnN2kOpen identity burst
+  s_N2k = N2k;
+
   // Set callback for when N2K network opens
   N2k->SetOnOpen(OnN2kOpen);
   N2k->Open();
@@ -362,6 +463,16 @@ void OnN2kOpen()
   WindScheduler.UpdateNextTime();
   // LED1 stops blinking and goes solid
   n2k_is_open = true;
+
+  // Identity burst – announce ourselves immediately so plotters that miss
+  // the address-claim window populate metadata without waiting for an ISO
+  // request. PGN 60928 (ISO Address Claim), 126996 (Product Information),
+  // 126998 (Configuration Information).
+  if (s_N2k != nullptr) {
+    s_N2k->SendIsoAddressClaim();              // PGN 60928
+    s_N2k->SendProductInformation();           // PGN 126996
+    s_N2k->SendConfigurationInformation();     // PGN 126998
+  }
 }
 
 // =====================
@@ -389,20 +500,26 @@ void NMEA2000_SendWindData(tNMEA2000_STM32 *N2k)
     bool valid;
     GetWindData(&WindSpeed, &WindAngle, &valid);
 
-    // Only send if we have valid data
+    // PGN 130306: Wind Data – always sent at the scheduled cadence.
+    // When the upstream sensor is missing or stale, send N2kDoubleNA so
+    // listeners can flag the data as unavailable rather than reading the
+    // last known value indefinitely.
+    // Apparent wind: angle 0° = bow, increases clockwise (0–360°).
     if (valid) {
-      // PGN 130306: Wind Data
-      // Parameters: SID, WindSpeed (m/s), WindAngle (radians), WindReference
-      // Apparent wind: angle 0° = bow, increases clockwise (0–360°).
       SetN2kWindSpeed(N2kMsg, windSID, WindSpeed, DegToRad(WindAngle), N2kWind_Apprent);
-      if (N2k->SendMsg(N2kMsg)) {
-        LED2_Flash();  // Brief flash on each successful TX
-      }
-
-      // Advance SID (0-252 per NMEA 2000 spec; 253-255 are reserved)
-      windSID++;
-      if (windSID > 252) windSID = 0;
+    } else {
+      SetN2kWindSpeed(N2kMsg, windSID, N2kDoubleNA, N2kDoubleNA, N2kWind_Apprent);
     }
+
+    if (N2k->SendMsg(N2kMsg)) {
+      LED2_Flash();  // Brief flash on each successful TX
+    }
+
+    // Advance SID (0-252 per NMEA 2000 spec; 253-255 are reserved).
+    // Same SID would be reused across companion PGNs of the same sample
+    // cycle if more sensors are added later (e.g. PGN 130311).
+    windSID++;
+    if (windSID > 252) windSID = 0;
   }
 }
 

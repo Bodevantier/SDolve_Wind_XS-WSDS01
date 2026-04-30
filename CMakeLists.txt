@@ -51,6 +51,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # User C sources
     Core/Src/rs485_wind.c
     Core/Src/serial_debug.c
+    Core/Src/n2k_storage.c
     
     # User C++ sources - Main application
     Core/Src/main.cpp
