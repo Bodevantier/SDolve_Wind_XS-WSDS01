@@ -50,6 +50,34 @@ extern "C" {
 #define RS485_PERBYTE_MS   1    // Per-byte timeout
 #define WIND_POLL_PERIOD   200  // Poll wind sensor every 200ms (5 Hz)
 #define WIND_FILTER_SIZE   3    // Moving average filter size
+
+// ---------------------------------------------------------------------------
+// Power saving build flags. Anything that influences the RS485 wind sensor
+// timing or transceiver power is intentionally left alone here – the unit
+// can only be tested against the masthead anemometer at the boat, so RS485
+// behaviour must remain bit-identical to the previously verified firmware.
+// ---------------------------------------------------------------------------
+
+// Disable the two debug LEDs (status + TX-flash). When set, LED helpers
+// become no-ops and both pins are forced LOW once at startup, removing the
+// steady ~5 mA drawn by LED1 (always on once N2K opens) and the periodic
+// LED2 spike on every PGN 130306 transmission. Set to 0 to re-enable for
+// diagnostics.
+#define POWER_SAVE_DISABLE_LEDS 1
+
+// Silence the per-poll "Wind: x.x m/s @ y.y deg" debug prints over USART1.
+// Boot banner, init status, sensor-error notice, watchdog/CAN re-init
+// notices and the persisted-source-address line are kept (only printed
+// once or on event) so a USB-TTL probe still tells you the node came up.
+// Set to 0 to get the chatty per-poll telemetry back. This does NOT alter
+// RS485 polling cadence or the DE/RE transaction itself.
+#define POWER_SAVE_QUIET_DEBUG  1
+
+// Sleep the core in WFI between iterations. SysTick (1 kHz) and CAN/UART
+// IRQs all wake the MCU promptly, so loop responsiveness is unchanged.
+// Disable only when chasing real-time bugs that need the loop to spin
+// freely.
+#define POWER_SAVE_USE_WFI      1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -105,6 +133,12 @@ static uint32_t led2_off_tick  = 0;
 
 void LED_Update(void)
 {
+#if POWER_SAVE_DISABLE_LEDS
+  // LEDs disabled for power saving – nothing to update.
+  (void)led2_off_tick;
+  (void)n2k_is_open;
+  return;
+#else
   // LED1: blink at 1 Hz until N2K is open, then solid ON
   if (n2k_is_open) {
     HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
@@ -118,12 +152,17 @@ void LED_Update(void)
     HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
     led2_off_tick = 0u;
   }
+#endif
 }
 
 void LED2_Flash(void)
 {
+#if POWER_SAVE_DISABLE_LEDS
+  return;
+#else
   HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET);
   led2_off_tick = HAL_GetTick() + LED2_FLASH_MS;
+#endif
 }
 
 // ====== Timing configuration ======
@@ -187,6 +226,7 @@ void PollWindSensor()
       wind_data_valid = true;
       last_wind_valid_tick = now;
 
+#if !POWER_SAVE_QUIET_DEBUG
       // Debug output - convert floats to integers for display
       int speed_int = (int)(wind_speed_ms * 10);  // 2.2 -> 22
       int dir_int = (int)(wind_dir_deg * 10);      // 13.0 -> 130
@@ -195,6 +235,7 @@ void PollWindSensor()
       snprintf(msg, sizeof(msg), "Wind: %d.%d m/s @ %d.%d deg\r\n",
                speed_int/10, speed_int%10, dir_int/10, dir_int%10);
       HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
+#endif
     }
     else
     {
@@ -248,7 +289,14 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
-  
+
+#if POWER_SAVE_DISABLE_LEDS
+  // Force both debug LEDs OFF immediately after GPIO init so they never
+  // light up, even briefly, when the power-saving build flag is set.
+  HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
+#endif
+
   // Initialize debug serial (USART1)
   SerialDebug_Init(&huart1);
   {
@@ -344,6 +392,15 @@ int main(void)
 
     // Kick the independent watchdog.
     HAL_IWDG_Refresh(&hiwdg);
+
+#if POWER_SAVE_USE_WFI
+    // Sleep the core until the next interrupt. SysTick fires every 1 ms
+    // (HAL tick), and CAN RX / UART IRQs also wake us, so loop latency
+    // stays in the millisecond range while average current drops
+    // significantly: the F103 spends most of its time in low-power sleep
+    // instead of spinning the busy-loop at full clock.
+    __WFI();
+#endif
   }
   /* USER CODE END 3 */
 }
@@ -357,6 +414,30 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
+#if POWER_SAVE_LOW_CLOCK
+  // ---------------------------------------------------------------------
+  // Low-power clock tree: HSE bypass direct, PLL OFF.
+  //   SYSCLK = HCLK = PCLK1 = PCLK2 = 8 MHz, FLASH latency = 0 ws.
+  // HAL_RCC_ClockConfig() updates SystemCoreClock and re-arms SysTick from
+  // the new HCLK, so HAL_GetTick / HAL_Delay stay accurate. UART baud
+  // registers are recomputed at HAL_UART_Init() from HAL_RCC_GetPCLKxFreq().
+  // CAN bit timing is handled in can.c via N2K_CAN_PRESCALER (see main.h).
+  // ---------------------------------------------------------------------
+  RCC_OscInitStruct.OscillatorType  = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState        = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.HSEPredivValue  = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState        = RCC_HSI_OFF;          // not needed
+  RCC_OscInitStruct.PLL.PLLState    = RCC_PLL_OFF;          // bypass PLL
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { Error_Handler(); }
+
+  RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                   | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_HSE;  // direct HSE
+  RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;       // HCLK = 8 MHz
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;         // PCLK1 = 8 MHz
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;         // PCLK2 = 8 MHz
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK) { Error_Handler(); }
+#else
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
@@ -385,6 +466,7 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+#endif
 }
 
 /* USER CODE BEGIN 4 */

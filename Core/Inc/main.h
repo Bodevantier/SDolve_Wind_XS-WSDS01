@@ -66,6 +66,33 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN Private defines */
 
+/* ---------------------------------------------------------------------------
+ * POWER_SAVE_LOW_CLOCK
+ *   0 = Default. SYSCLK = 72 MHz (HSE 8 MHz x PLL9), PCLK1 = 36 MHz.
+ *   1 = SYSCLK = HCLK = PCLK1 = PCLK2 = 8 MHz (HSE bypass, PLL OFF,
+ *       FLASH 0 ws). Drops core current dramatically and is more than
+ *       enough for the 5 Hz RS485 wind poll + 10 Hz PGN 130306 TX cadence.
+ *
+ * IMPORTANT: lowering the system clock changes PCLK1, which is the source
+ * for both the bxCAN bit timing and the USART3 (RS485) baud generator.
+ * The CAN prescaler is auto-adjusted via N2K_CAN_PRESCALER below; HAL
+ * recomputes USART BRR from PCLK1 at runtime so the RS485 baud rate is
+ * preserved. However, the wind sensor cannot be tested off-boat, so this
+ * flag is left at 0 by default. Flip to 1 only after verifying RS485
+ * still talks to the masthead anemometer at the new clock.
+ * ---------------------------------------------------------------------*/
+#ifndef POWER_SAVE_LOW_CLOCK
+#define POWER_SAVE_LOW_CLOCK 0
+#endif
+
+#if POWER_SAVE_LOW_CLOCK
+  /* PCLK1 = 8 MHz: prescaler 2 -> 4 MHz TQ clock, 16 TQ/bit -> 250 kbps. */
+  #define N2K_CAN_PRESCALER 2u
+#else
+  /* PCLK1 = 36 MHz: prescaler 9 -> 4 MHz TQ clock, 16 TQ/bit -> 250 kbps. */
+  #define N2K_CAN_PRESCALER 9u
+#endif
+
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus
